@@ -1860,7 +1860,10 @@ function parseBlocks(src) {
           const stripped = stripCols(rest, col, t.indent);
           t.lines.push(stripped.s + (eol ? '\n' : ''));
         } else if (t.t === 'html') {
-          if (t.done) popBlock(true);
+          // A finished HTML block loses its trailing newline only when
+          // the next line is truly empty. A whitespace-only line keeps
+          // it, like a non-blank line does.
+          if (t.done) popBlock(rest === '');
           else if (t.kind <= 5) t.lines.push(rest + (eol ? '\n' : ''));
           else popBlock(true);
         } else if (t.t === 'table') {
