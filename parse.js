@@ -898,6 +898,7 @@ function parseBlocks(src) {
     let pos = 0;
     let depth = 0;
     let allMatched = true;
+    let preQuotePos = 0;
     for (let s = 1; s < stack.length; s++) {
       const node = stack[s];
       if (node.t === 'quote') {
@@ -906,7 +907,7 @@ function parseBlocks(src) {
         if (p < e.length && e.charCodeAt(p) === 62) { // >
           p++;
           if (p < e.length && (e.charCodeAt(p) === 32 || e.charCodeAt(p) === 9)) p++;
-          pos = p; depth = s;
+          preQuotePos = pos; pos = p; depth = s;
         } else { allMatched = false; break; }
       } else if (node.t === 'item') {
         // An empty item followed by a blank line does not match
@@ -975,10 +976,35 @@ function parseBlocks(src) {
         if (len >= leaf.fenceLen && lineBlankFrom(L, q)) ok = true;
       }
       if (ok) { closeLeaf(); continue; }
-      let q = pos, strip = 0;
-      while (q < e.length && e.charCodeAt(q) === 32 && strip < leaf.fenceIndent) { strip++; q++; }
-      let content = lineContent(L, q);
-      if (q > 0 && content.charCodeAt(0) === 9) content = expandLeadTabs(content, q);
+      let content = lineContent(L, pos);
+      if (stack.length > 1) {
+        // Inside a container: marked outdents container prefixes in
+        // columns, so expand the leading whitespace run to spaces,
+        // then strip the fence indent (in columns). A tab after a `>`
+        // marker expands at its column in the quote's text
+        // (pos - preQuotePos), not its absolute column.
+        let _d = depth; while (_d >= 1 && stack[_d].t === 'list') _d--;
+        let col = (stack[_d].t === 'quote') ? pos - preQuotePos : pos, k = 0, out = '';
+        while (k < content.length) {
+          const cc = content.charCodeAt(k);
+          if (cc === 32) { out += ' '; col++; k++; }
+          else if (cc === 9) { const w = 4 - (col % 4); out += '    '.slice(0, w); col += w; k++; }
+          else break;
+        }
+        content = out + content.slice(k);
+        // Dt is a no-op for ~~~ fences (indentCodeCompensation only
+        // matches ```), so a tilde fence keeps its full indent.
+        let cut = 0;
+        while (leaf.fenceCh !== 126 && cut < leaf.fenceIndent && cut < content.length && content.charCodeAt(cut) === 32) cut++;
+        content = content.slice(cut);
+      } else {
+        // Top level: marked's Dt strips up to fenceIndent leading
+        // whitespace characters (a tab counts as one and survives
+        // when beyond the strip); no strip at all for ~~~ fences.
+        let cut = 0;
+        while (leaf.fenceCh !== 126 && cut < leaf.fenceIndent && cut < content.length && (content.charCodeAt(cut) === 32 || content.charCodeAt(cut) === 9)) cut++;
+        content = content.slice(cut);
+      }
       leaf.lines.push(content);
       leaf.lastLi = li;
       continue;
@@ -1080,6 +1106,7 @@ function parseBlocks(src) {
           else if (leaf && leaf.t === 'para') { closeLeaf(); }
           p++;
           if (p < e.length && (e.charCodeAt(p) === 32 || e.charCodeAt(p) === 9)) p++;
+          preQuotePos = cur;
           const q = { t: 'quote', children: [] };
           addChild(q);
           stack.push(q);
@@ -1208,6 +1235,10 @@ function parseBlocks(src) {
         if (leaf) closeLeaf();
         started = true; break;
       }
+      // Deepest container the paragraph line sits in (for the quote
+      // J-expansion of a leading tab): walk past trailing lists.
+      let _pd = stack.length - 1; while (_pd >= 1 && stack[_pd].t === 'list') _pd--;
+      const paraInQuote = stack[_pd].t === 'quote';
       if (leaf && leaf.t === 'para') {
         let col = cur;
         let pad = 0;
@@ -1259,10 +1290,16 @@ function parseBlocks(src) {
             }
           }
         }
-        if (!pushed) leaf.lines.push({ L, col });
+        if (!pushed) {
+          let ln = { L, col };
+          if (allMatched && paraInQuote) { const s0 = lineContent(L, col); const s1 = expandLeadTabs(s0, col - preQuotePos); if (s1 !== s0) ln.txt = s1; }
+          leaf.lines.push(ln);
+        }
       } else {
         if (!allMatched) { closeLeaf(); closeContainers(depth); closeOpenLists(); }
-        const p = { t: 'para', lines: [{ L, col: cur }] };
+        let _ln = { L, col: cur };
+        if (paraInQuote) { const s0 = lineContent(L, cur); const s1 = expandLeadTabs(s0, cur - preQuotePos); if (s1 !== s0) _ln.txt = s1; }
+        const p = { t: 'para', lines: [_ln] };
         addChild(p);
         leaf = p;
       }
@@ -1294,10 +1331,30 @@ function parseBlocks(src) {
   }
   markEndsBlank(doc);
   fixHtmlTrailingNewlines(doc, []);
+  markTrimEnd(doc);
   return { doc, refs };
 
   function paraText(p) {
-    return p.lines.map(x => (x.pad ? '    '.slice(0, x.pad) : '') + lineContent(x.L, x.col)).join('\n');
+    return p.lines.map(x => x.txt !== undefined ? x.txt : (x.pad ? '    '.slice(0, x.pad) : '') + lineContent(x.L, x.col)).join('\n');
+  }
+  // marked trimEnd()s every list's last item text: a paragraph that
+  // ends the last item (directly, or through trailing blockquotes)
+  // loses its trailing spaces/tabs. A nested list's own rule covers
+  // text ending inside it, so descent stops at a list.
+  function markTrimEnd(node) {
+    if (!node.children) return;
+    for (const ch of node.children) {
+      if (ch.t === 'list' && ch.children.length > 0) {
+        let n = ch.children[ch.children.length - 1];
+        while (n && n.children && n.children.length > 0) {
+          const last = n.children[n.children.length - 1];
+          if (last.t === 'quote') { n = last; continue; }
+          if (last.t === 'para') last.trimEnd = true;
+          break;
+        }
+      }
+      markTrimEnd(ch);
+    }
   }
   function markEndsBlank(node) {
     if (!node.children) return;
@@ -2393,7 +2450,8 @@ function renderBlocks(node, out, refs, st) {
   }
 }
 function paraTextOf(p) {
-  return p.lines.map(x => (x.pad ? '    '.slice(0, x.pad) : '') + lineContent(x.L, x.col)).join('\n');
+  const t = p.lines.map(x => x.txt !== undefined ? x.txt : (x.pad ? '    '.slice(0, x.pad) : '') + lineContent(x.L, x.col)).join('\n');
+  return p.trimEnd ? t.replace(/[ \t]+$/, '') : t;
 }
 
 // ---------- entry point ----------
