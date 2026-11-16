@@ -1500,16 +1500,26 @@ function parseInline(text, refs, st) {
       let j = i;
       while (j < n && text.charCodeAt(j) === 96) j++;
       const run = j - i;
-      // find a matching run of the same length
+      // find a matching run of the same length -- but never swallow a
+      // `]` that closes a link which would form (marked matches the
+      // LINK rule first and tokenises the label in isolation, where no
+      // such closer exists). A rejected span leaves its backticks
+      // literal and the `]` for tryLink.
       let k = j;
       let found = -1;
       while (k < n) {
+        if (text.charCodeAt(k) === 93 && linkWouldFormAt(k)) { found = -2; break; }
         if (text.charCodeAt(k) === 96) {
           let m = k;
           while (m < n && text.charCodeAt(m) === 96) m++;
           if (m - k === run) { found = k; break; }
           k = m;
         } else k++;
+      }
+      if (found === -2) {
+        pushText(text.slice(i, j));
+        i = j;
+        continue;
       }
       if (found !== -1) {
         let content = text.slice(j, found).replace(/\n/g, ' ');
