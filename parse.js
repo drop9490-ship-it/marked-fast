@@ -1776,6 +1776,77 @@ function parseInline(text, refs, st) {
     }
     return false;
   }
+  // Validate a raw link label against the label grammar's backtick
+  // rules: every backtick run must open a code span whose content holds
+  // no backtick (closed by the next backtick run), or be a run of 2+
+  // backticks immediately before the label's closing `]`. A run that
+  // cannot be consumed this way (e.g. `` `` a ` b `` `` followed by
+  // more text) makes the whole label unmatchable, so the link never
+  // forms and the brackets stay literal.
+  function labelBackticksOk(raw) {
+    let i = 0;
+    const n = raw.length;
+    while (i < n) {
+      const c = raw.charCodeAt(i);
+      if (c === 92) { i += 2; continue; } // backslash escape
+      if (c === 91) { // nested [...] group: skip it balanced
+        let depth = 1, j = i + 1;
+        while (j < n && depth > 0) {
+          if (raw.charCodeAt(j) === 92) { j += 2; continue; }
+          if (raw.charCodeAt(j) === 91) depth++;
+          else if (raw.charCodeAt(j) === 93) depth--;
+          j++;
+        }
+        if (depth !== 0) return false;
+        i = j;
+        continue;
+      }
+      if (c === 96) { // backtick run
+        let j = i;
+        while (j < n && raw.charCodeAt(j) === 96) j++;
+        if (j - i >= 2 && j >= n) { i = j; continue; } // trailing run before ]
+        // code span: content up to the next backtick run (no backtick
+        // allowed inside), then that run closes it
+        let k = j;
+        while (k < n && raw.charCodeAt(k) !== 96) k++;
+        if (k >= n) return false;
+        while (k < n && raw.charCodeAt(k) === 96) k++;
+        i = k;
+        continue;
+      }
+      i++;
+    }
+    return true;
+  }
+  // When a link fails but the `]` is followed by a complete `(...)`
+  // group, the span is an attempted inline link: marked's emphasis
+  // masking erases its delimiters from the closer index, so a `*`/`_`
+  // run inside the label cannot serve as a closer (it may still open
+  // onto a closer outside the span). Clear canClose on those runs.
+  function maskFailedInlineLink(opener, closeIdx) {
+    if (text.charCodeAt(closeIdx + 1) !== 40) return; // not '('
+    // The masking pattern's label cannot contain a `[` (it has no
+    // nested-bracket alternative), so a label holding an inner link is
+    // never masked and its emphasis still forms.
+    if (text.slice(opener.pos + 1, closeIdx).indexOf('[') !== -1) return;
+    let depth = 0, end = -1;
+    for (let i = closeIdx + 1; i < n; i++) {
+      const c = text.charCodeAt(i);
+      if (c === 92) { i++; continue; } // escape
+      if (c === 40) { depth++; if (depth > 2) return; }
+      else if (c === 41) { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end === -1) return; // no complete group: no masking
+    // The label's nodes are everything after the opener's node (the
+    // scanner is at `]`, so nothing past the label is in `nodes` yet).
+    // A `*`/`_` run whose node is one of them loses canClose.
+    const opIdx = nodes.indexOf(opener.node);
+    if (opIdx === -1) return;
+    const labelNodes = nodes.slice(opIdx + 1);
+    for (const d of delims) {
+      if ((d.ch === '*' || d.ch === '_') && labelNodes.indexOf(d.node) !== -1) d.canClose = false;
+    }
+  }
   function tryLink(closeIdx) {
     let opener = null;
     for (let k = delims.length - 1; k >= 0; k--) {
@@ -1783,8 +1854,16 @@ function parseInline(text, refs, st) {
       if (d.ch === '[' && d.active) { opener = d; break; }
     }
     if (!opener) return -1;
+    // The label must match the label grammar; a code span in it whose
+    // content holds a backtick dooms the link (the brackets stay
+    // literal and later `]`/shortcuts are still tried).
+    if (!labelBackticksOk(text.slice(opener.pos + 1, closeIdx))) {
+      opener.active = false;
+      maskFailedInlineLink(opener, closeIdx);
+      return -1;
+    }
     const opIdx = nodes.indexOf(opener.node);
-    if (opIdx === -1) { opener.active = false; return -1; }
+    if (opIdx === -1) { opener.active = false; maskFailedInlineLink(opener, closeIdx); return -1; }
     const children = nodes.slice(opIdx + 1);
     let after = closeIdx + 1;
     let dest = null, title = null, end = -1;
@@ -1803,7 +1882,7 @@ function parseInline(text, refs, st) {
         if (ref) { dest = ref.dest; title = ref.title; end = lab.end; }
         // A [label] was present but matched no definition: this was a
         // full-reference attempt, so there is no shortcut fallback.
-        if (end === -1) { opener.active = false; return -1; }
+        if (end === -1) { opener.active = false; maskFailedInlineLink(opener, closeIdx); return -1; }
       }
     }
     if (end === -1) {
@@ -1815,12 +1894,14 @@ function parseInline(text, refs, st) {
     }
     if (end === -1) {
       opener.active = false;
+      maskFailedInlineLink(opener, closeIdx);
       return -1;
     }
     // A link cannot contain another link (images are exempt: a link may
     // contain an image, and an image's alt may contain a link).
     if (!opener.image && containsLink(children)) {
       opener.active = false;
+      maskFailedInlineLink(opener, closeIdx);
       return -1;
     }
     // Deactivate [ delimiters inside the link text; re-tag emphasis
