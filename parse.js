@@ -529,15 +529,23 @@ function parseBlocks(src) {
   // item's text is trimEnd()ed), or a terminated top-level end of input.
   // An empty line followed by more content, two or more trailing blank
   // lines, or a container that ends right after the block all drop it.
+  // EXCEPTION: types 6 and 7 (block-level tags and other tags) end with
+  // (?:(?:\n[ \t]*)+\n|$) in marked's regex, which consumes a following
+  // whitespace-only line as a blank line, so for them a whitespace-only
+  // line drops the newline; types 1-5 (pre/script/comment/pi/decl/cdata)
+  // keep it, their regexes ending in (\n+) or [^\n]*\n*.
   function fixHtmlTrailingNewlines(node, chain) {
     if (node.t === 'html') {
       let keepNL = false;
+      const blankEnds = node.htmlType === 6 || node.htmlType === 7;
+      const isBlank = (s) => { for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c !== 32 && c !== 9) return false; } return true; };
       if (terminated(node.lastLi) && node.lines.length > 0) {
         const parent = chain[chain.length - 1];
         if (!parent || parent.t === 'doc') {
           // Top level: the sub-input is the raw source. Keep iff the
-          // next raw line is non-empty (whitespace counts) or absent.
-          keepNL = node.lastLi + 1 >= n || lines[node.lastLi + 1].exp.length > 0;
+          // next raw line is non-empty (whitespace counts, except for
+          // types 6/7 where it is a blank line) or absent.
+          keepNL = node.lastLi + 1 >= n || (blankEnds ? !isBlank(lines[node.lastLi + 1].exp) : lines[node.lastLi + 1].exp.length > 0);
         } else {
           // Inside containers: scan the lines after lastLi that belong
           // to this container chain, counting leading empty lines.
@@ -546,7 +554,7 @@ function parseBlocks(src) {
           for (let j = node.lastLi + 1; j < n; j++) {
             const m = matchChain(j, chain);
             if (!m.ok) break; // container ended
-            if (m.content.length > 0) { keepNL = emptyCount === 0; decided = true; break; }
+            if (blankEnds ? !isBlank(m.content) : m.content.length > 0) { keepNL = emptyCount === 0; decided = true; break; }
             emptyCount++;
           }
           if (!decided) {
@@ -681,43 +689,23 @@ function parseBlocks(src) {
   // Split a table row on unescaped pipes not inside code spans.
   // If `delim` is set, leading/trailing pipes are ignored and empty edge
   // cells dropped (delimiter-row semantics).
+  // Split a table row on unescaped `|`. Marked's splitter (de) has NO
+  // code-span tracking: a `|` inside backticks still splits (only `\|`
+  // is safe), so a `` ``add` `` cell followed by `| `a \| b` `` splits
+  // at that `|` even though an inline code span would span it.
   function splitRow(line, delim) {
     const cells = [];
     let cur = '';
     let i = 0;
-    let inCode = 0; // backtick run length currently open, 0 = none
-    let codeRun = 0;
     while (i < line.length) {
       const c = line.charCodeAt(i);
       if (c === 92 && i + 1 < line.length) {
-        // \| is an escaped pipe: it becomes a literal | in the cell (the
-        // backslash is consumed here, so it also works inside code spans).
+        // \| is an escaped pipe: it becomes a literal | in the cell.
         // Other escapes are kept for the inline parser.
         if (line.charCodeAt(i + 1) === 124) { cur += '|'; i += 2; continue; }
         cur += line[i] + line[i + 1]; i += 2; continue;
       }
-      if (c === 96) { // backtick
-        let j = i;
-        while (j < line.length && line.charCodeAt(j) === 96) j++;
-        const run = j - i;
-        if (inCode === 0) {
-          // Only open a code span if a matching close run exists later;
-          // otherwise the backticks are literal and do not protect `|`.
-          let k = j, found = false;
-          while (k < line.length) {
-            if (line.charCodeAt(k) === 96) {
-              let m = k;
-              while (m < line.length && line.charCodeAt(m) === 96) m++;
-              if (m - k === run) { found = true; break; }
-              k = m;
-            } else k++;
-          }
-          if (found) inCode = run;
-        }
-        else if (run === inCode) { inCode = 0; }
-        cur += line.slice(i, j); i = j; continue;
-      }
-      if (c === 124 && inCode === 0) { // |
+      if (c === 124) { // |
         cells.push(cur); cur = ''; i++; continue;
       }
       cur += line[i]; i++;
