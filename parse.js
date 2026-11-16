@@ -465,19 +465,104 @@ function parseBlocks(src) {
       }
       leaf.text = ls.length === 0 ? '' : ls.join('\n') + '\n';
     } else if (leaf.t === 'html') {
-      // The trailing newline is kept when the block's last line was
-      // terminated and the following line is part of the same container.
-      // At the top level that means the next line is not blank; inside
-      // a list item it is inverted (a blank line is inside the item,
-      // while a new list item is a different container).
-      const nextBlank = leaf.lastLi + 1 < n && lineBlankFrom(lines[leaf.lastLi + 1], 0);
-      const parent = stack[stack.length - 1];
-      const keepNL = parent && parent.t === 'item'
-        ? terminated(leaf.lastLi) && nextBlank
-        : terminated(leaf.lastLi) && !nextBlank;
-      leaf.text = leaf.lines.join('\n') + (leaf.lines.length > 0 && keepNL ? '\n' : '');
+      // Provisional text without a trailing newline; the post-pass
+      // fixHtmlTrailingNewlines() at the end of parseBlocks sets the
+      // correct trailing newline (it needs the finished tree to know
+      // whether the block sits in the last item of a list).
+      leaf.text = leaf.lines.join('\n');
     }
     leaf = null;
+  }
+  // Does source line j match every container in chain (outermost first,
+  // doc excluded), the Phase-1 container matching, read-only? Returns
+  // {ok, content} where content is the line's content in the container's
+  // sub-input (after container prefixes); null when it does not match.
+  // For a blank line inside an item, marked strips the item indent from
+  // it too, so the indent is advanced here to compute the content.
+  function matchChain(j, chain) {
+    const L = lines[j];
+    const e = L.exp;
+    let pos = 0;
+    for (const node of chain) {
+      if (node.t === 'quote') {
+        let p = pos, sp = 0;
+        while (p < e.length && e.charCodeAt(p) === 32 && sp < 3) { sp++; p++; }
+        if (p < e.length && e.charCodeAt(p) === 62) {
+          p++;
+          if (p < e.length && (e.charCodeAt(p) === 32 || e.charCodeAt(p) === 9)) p++;
+          pos = p;
+        } else return { ok: false, content: null };
+      } else if (node.t === 'item') {
+        if (lineBlankFrom(L, pos)) {
+          let p = pos, avail = 0;
+          while (p < e.length && e.charCodeAt(p) === 32 && avail < node.contentIndent) { avail++; p++; }
+          pos = p;
+        } else {
+          const need = node.contentIndent;
+          let p = pos, avail = 0;
+          while (p < e.length && e.charCodeAt(p) === 32 && avail < need) { avail++; p++; }
+          if (avail >= need) pos = p;
+          else return { ok: false, content: null };
+        }
+      }
+      // 'list' matches always, no prefix.
+    }
+    return { ok: true, content: e.slice(pos) };
+  }
+  // Does marked's last-item trimEnd() strip this html block's trailing
+  // newline? Only when the block sits directly in an item (a quote's '>'
+  // markers shield the newline), that item is the last item of its list,
+  // and the block is the item's last child.
+  function htmlAtEndOfLastItem(node, chain) {
+    const parent = chain[chain.length - 1];
+    if (!parent || parent.t !== 'item') return false;
+    const list = chain[chain.length - 2];
+    if (!list || list.t !== 'list') return false;
+    if (list.children[list.children.length - 1] !== parent) return false;
+    return parent.children[parent.children.length - 1] === node;
+  }
+  // Fix up every html block's trailing newline. Marked's html token keeps
+  // one trailing newline iff the container's sub-input has exactly one
+  // newline after the block's last line: a following non-empty line
+  // (even a whitespace-only line, which stops the regex's \n+), a single
+  // trailing blank line at the end of the container (unless the last
+  // item's text is trimEnd()ed), or a terminated top-level end of input.
+  // An empty line followed by more content, two or more trailing blank
+  // lines, or a container that ends right after the block all drop it.
+  function fixHtmlTrailingNewlines(node, chain) {
+    if (node.t === 'html') {
+      let keepNL = false;
+      if (terminated(node.lastLi) && node.lines.length > 0) {
+        const parent = chain[chain.length - 1];
+        if (!parent || parent.t === 'doc') {
+          // Top level: the sub-input is the raw source. Keep iff the
+          // next raw line is non-empty (whitespace counts) or absent.
+          keepNL = node.lastLi + 1 >= n || lines[node.lastLi + 1].exp.length > 0;
+        } else {
+          // Inside containers: scan the lines after lastLi that belong
+          // to this container chain, counting leading empty lines.
+          let emptyCount = 0;
+          let decided = false;
+          for (let j = node.lastLi + 1; j < n; j++) {
+            const m = matchChain(j, chain);
+            if (!m.ok) break; // container ended
+            if (m.content.length > 0) { keepNL = emptyCount === 0; decided = true; break; }
+            emptyCount++;
+          }
+          if (!decided) {
+            // Container ended (or EOF): keep only for exactly one
+            // trailing empty line, and not when the last item is trimmed.
+            keepNL = emptyCount === 1 && !htmlAtEndOfLastItem(node, chain);
+          }
+        }
+      }
+      node.text = node.lines.join('\n') + (keepNL ? '\n' : '');
+    }
+    if (node.children) {
+      const childChain = (node.t === 'quote' || node.t === 'item' || node.t === 'list')
+        ? chain.concat(node) : chain;
+      for (const ch of node.children) fixHtmlTrailingNewlines(ch, childChain);
+    }
   }
   // Strip leading link reference definitions from a paragraph's lines,
   // registering them in refs. Returns the remaining lines.
@@ -1198,6 +1283,7 @@ function parseBlocks(src) {
     if (node.t === 'list') finalizeList(node);
   }
   markEndsBlank(doc);
+  fixHtmlTrailingNewlines(doc, []);
   return { doc, refs };
 
   function paraText(p) {
