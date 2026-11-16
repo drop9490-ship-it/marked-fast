@@ -2069,13 +2069,15 @@ function parseBlocks(src) {
     }
     if (failedAt !== -1) {
       const t = tip();
-      if (t.t === 'fence' && !isBlankStr(rest) && !isClosingFence(rest, col, t) && stack[failedAt].t === 'item') {
+      if (t.t === 'fence' && !isBlankStr(rest) && !isClosingFence(rest, col, t) && stack[failedAt].t === 'item' && t.lines.length > 0) {
         // A line inside a fenced code block that does not match the
-        // enclosing list item is still fence content: only a closing
-        // fence ends the block. (For a block quote the fence does end:
-        // a line without the quote marker closes the quote and the
-        // fence.) The line is stripped to the fence's absolute indent
-        // (the containers it missed contribute nothing).
+        // enclosing list item is still fence content — but only once
+        // the fence already holds a line. A non-matching line while
+        // the fence is still empty closes it (and the item) instead.
+        // (For a block quote the fence does end: a line without the
+        // quote marker closes the quote and the fence.) The line is
+        // stripped to the fence's absolute indent (the containers it
+        // missed contribute nothing).
         const strip = Math.max(0, (t.absIndent || 0) - col);
         const stripped = stripCols(rest, col, strip);
         t.lines.push(stripped.s + (line.eol ? '\n' : ''));
