@@ -13,6 +13,10 @@ const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 const cases = JSON.parse(readFileSync(join(inputDir, 'cases.json'), 'utf8'));
+if (!Array.isArray(cases)) throw new Error('cases.json must contain an array of {id, markdown} cases');
+for (let i = 0; i < cases.length; i++) {
+  if (typeof cases[i]?.markdown !== 'string') throw new Error(`case ${i} has no markdown string`);
+}
 const html = new Array(cases.length);
 for (let i = 0; i < cases.length; i++) html[i] = parse(cases[i].markdown);
 
