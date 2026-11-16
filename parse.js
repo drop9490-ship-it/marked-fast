@@ -247,6 +247,39 @@ function stripCols(s, startCol, n, keepTab) {
   return { s: prefix + s.slice(i), col };
 }
 
+function expandLeadingTabs(s, startCol, parentCol) {
+  // Expand the tabs in the leading whitespace of s to spaces. The
+  // width of a tab is measured from its effective column: the
+  // absolute column minus the column where the innermost container's
+  // parent content starts. Spaces in the leading run are kept as
+  // they are; the run stops at the first non-whitespace character.
+  let i = 0;
+  let out = '';
+  let col = startCol;
+  while (i < s.length && (s[i] === ' ' || s[i] === '\t')) {
+    if (s[i] === ' ') { out += ' '; col++; i++; continue; }
+    const eff = col - parentCol;
+    const w = 4 - (eff % 4);
+    out += ' '.repeat(w);
+    col += w;
+    i++;
+  }
+  return out + s.slice(i);
+}
+
+function fenceLine(t, rest, col) {
+  // The content of one fenced-code line. When the leading whitespace
+  // holds a tab and the fence sits inside a container, the tab is
+  // expanded to spaces from its effective column and the leading
+  // spaces are kept; otherwise the fence indent is stripped.
+  let k = 0;
+  while (k < rest.length && (rest[k] === ' ' || rest[k] === '\t')) k++;
+  if (t.parentCol !== undefined && rest.slice(0, k).indexOf('\t') !== -1) {
+    return expandLeadingTabs(rest, col, t.parentCol);
+  }
+  return stripCols(rest, col, t.indent).s;
+}
+
 function isBlankStr(s) {
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
@@ -1857,8 +1890,7 @@ function parseBlocks(src) {
           const stripped = stripCols(rest, col, 4, true);
           t.lines.push(stripped.s + (eol ? '\n' : ''));
         } else if (t.t === 'fence') {
-          const stripped = stripCols(rest, col, t.indent);
-          t.lines.push(stripped.s + (eol ? '\n' : ''));
+          t.lines.push(fenceLine(t, rest, col) + (eol ? '\n' : ''));
         } else if (t.t === 'html') {
           // A finished HTML block loses its trailing newline only when
           // the next line is truly empty. A whitespace-only line keeps
@@ -1882,8 +1914,7 @@ function parseBlocks(src) {
       }
       if (t.t === 'fence') {
         if (isClosingFence(rest, col, t)) { popBlock(); return extra; }
-        const stripped = stripCols(rest, col, t.indent);
-        t.lines.push(stripped.s + (eol ? '\n' : ''));
+        t.lines.push(fenceLine(t, rest, col) + (eol ? '\n' : ''));
         return extra;
       }
       if (t.t === 'code') {
@@ -1969,7 +2000,18 @@ function parseBlocks(src) {
       }
       const f = fenceStart(rest, col);
       if (f) {
+        // The column where the innermost container's parent content
+        // starts: the column after all container markers were
+        // stripped, minus the innermost marker's width. A tab in the
+        // fence's content is expanded from its column measured
+        // against this base. Only set when the fence sits inside a
+        // container; a top-level fence keeps its tabs literal.
+        const parent = tip();
+        let markerWidth = -1;
+        if (parent.t === 'quote') markerWidth = 2;
+        else if (parent.t === 'item') markerWidth = parent.contentIndent;
         const fence = { t: 'fence', lang: f.lang, lines: [], fenceCh: f.ch, fenceLen: f.len, indent: ind.cols, absIndent: col + ind.cols };
+        if (markerWidth >= 0) fence.parentCol = col - markerWidth;
         appendBlock(fence);
         stack.push(fence);
         return extra;
