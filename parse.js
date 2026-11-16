@@ -840,8 +840,44 @@ function parseBlocks(src) {
     // Multi-line leaves consume their lines before anything else.
     if (leaf && leaf.t === 'code' && leaf.fenced) {
       if (!allMatched) {
-        closeLeaf(); closeContainers(depth);
-        li--; continue;
+        // RC-J1: if the mismatch is list-item containers only (no
+        // blockquote) and the fence already has content, the line is
+        // fence content, not the end of the fence. A non-matching first
+        // content line, or a line that looks like a closing fence, still
+        // ends the fence (close + retry).
+        let listOnly = true;
+        for (let s = depth + 1; s < stack.length; s++) {
+          if (stack[s].t === 'quote') { listOnly = false; break; }
+        }
+        let isClose = false;
+        if (listOnly) {
+          let p = pos, sp = 0;
+          while (p < e.length && e.charCodeAt(p) === 32 && sp < 3) { sp++; p++; }
+          if (p < e.length && e.charCodeAt(p) === leaf.fenceCh) {
+            let len = 0, q = p;
+            while (q < e.length && e.charCodeAt(q) === leaf.fenceCh) { len++; q++; }
+            if (len >= leaf.fenceLen && lineBlankFrom(L, q)) isClose = true;
+          }
+        }
+        if (!listOnly || isClose || leaf.lines.length === 0) {
+          closeLeaf(); closeContainers(depth); closeOpenLists();
+          li--; continue;
+        }
+        // Fence content: strip the innermost item's content indent, but
+        // only when the line has at least that many leading spaces;
+        // otherwise keep the line whole.
+        let need = 0;
+        for (let s = stack.length - 1; s >= 1; s--) {
+          if (stack[s].t === 'item') { need = stack[s].contentIndent; break; }
+        }
+        let sp = 0;
+        while (pos + sp < e.length && e.charCodeAt(pos + sp) === 32) sp++;
+        let q = sp >= need ? pos + need : pos;
+        let content = lineContent(L, q);
+        if (q > 0 && content.charCodeAt(0) === 9) content = expandLeadTabs(content, q);
+        leaf.lines.push(content);
+        leaf.lastLi = li;
+        continue;
       }
       let p = pos, sp = 0;
       while (p < e.length && e.charCodeAt(p) === 32 && sp < 3) { sp++; p++; }
@@ -861,7 +897,7 @@ function parseBlocks(src) {
       continue;
     }
     if (leaf && leaf.t === 'html') {
-      if (!allMatched) { closeLeaf(); closeContainers(depth); li--; continue; }
+      if (!allMatched) { closeLeaf(); closeContainers(depth); closeOpenLists(); li--; continue; }
       if (blank) {
         if (leaf.htmlType === 6 || leaf.htmlType === 7) { closeLeaf(); }
         else { leaf.lines.push(''); leaf.lastLi = li; continue; }
@@ -874,7 +910,7 @@ function parseBlocks(src) {
       }
     }
     if (leaf && leaf.t === 'code' && !leaf.fenced) {
-      if (!allMatched) { closeLeaf(); closeContainers(depth); li--; continue; }
+      if (!allMatched) { closeLeaf(); closeContainers(depth); closeOpenLists(); li--; continue; }
       let p = pos, sp = 0;
       while (p < e.length && e.charCodeAt(p) === 32 && sp < 4) { sp++; p++; }
       if (sp >= 4) { leaf.lines.push(lineContent(L, p)); leaf.lastLi = li; continue; }
