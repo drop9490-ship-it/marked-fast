@@ -1,24 +1,23 @@
-// Driver for markdown-render-speed-02.
-// Reads every case from /input/cases.json (an array of {id, markdown}),
-// renders each one alone with parse() from ./parse.js, and writes
-// /output/html.json: the HTML strings, one per case, in the cases' order.
-// MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR stand in for /input and /output
-// outside the scoring container.
+// main.ts — driver for the marked-fast entry.
+//
+// Reads the cases the kit hands over, renders each one with the local
+// parse() implementation, and writes the HTML strings back out in the
+// same order. This is the only file in the repo that touches the
+// filesystem; parse.js itself is a pure function of its input string.
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { parse } from './parse.js';
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { parse } from "./parse.js";
 
-const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const inputDir = process.env.MAKEFUN_INPUT_DIR ?? "/input";
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
 
-const cases = JSON.parse(readFileSync(join(inputDir, 'cases.json'), 'utf8'));
-if (!Array.isArray(cases)) throw new Error('cases.json must contain an array of {id, markdown} cases');
-for (let i = 0; i < cases.length; i++) {
-  if (typeof cases[i]?.markdown !== 'string') throw new Error(`case ${i} has no markdown string`);
-}
-const html = new Array(cases.length);
-for (let i = 0; i < cases.length; i++) html[i] = parse(cases[i].markdown);
+const cases = JSON.parse(readFileSync(join(inputDir, "cases.json"), "utf8"));
+
+// Render every case in order. The output is a plain JSON array of HTML
+// strings, one per input case, in exactly the same order.
+const html = cases.map((c: { id: string; markdown: string }) => parse(c.markdown));
 
 mkdirSync(outputDir, { recursive: true });
-writeFileSync(join(outputDir, 'html.json'), JSON.stringify(html));
+writeFileSync(join(outputDir, "html.json"), JSON.stringify(html));
+
