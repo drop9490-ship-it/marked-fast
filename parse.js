@@ -1598,13 +1598,14 @@ function parseInline(text, refs, st) {
     }
     // GFM extended autolinks: www. / http(s):// / ftp:// / mailto: / xmpp: / emails in text
     // (schemes are case-insensitive; www. is lowercase-only)
-    // Inside a link label, http(s):// / ftp:// / www. URLs are NOT
-    // autolinked (marked leaves them as plain text in the link), but
-    // mailto:/xmpp: and bare emails still are.
+    // These fire even inside a link label: marked only suppresses them
+    // while tokenising a link that *forms* (state.inLink), so a label
+    // whose link fails keeps its autolinks (doc-39). A formed link
+    // unwraps them back to text in tryLink (gfm flag).
     if (!st.inLink && (c === 119 || c === 104 || c === 72 || c === 102 || c === 70 || c === 109 || c === 77 || c === 120 || c === 88)) { // w h H f F m M x X
       const m = matchGfmUrl(i);
       if (m) {
-        nodes.push({ k: 5, href: m.href, title: null, auto: true, children: [{ k: 0, s: m.text }] });
+        nodes.push({ k: 5, href: m.href, title: null, auto: true, gfm: true, children: [{ k: 0, s: m.text }] });
         i = m.end;
         continue;
       }
@@ -1847,6 +1848,20 @@ function parseInline(text, refs, st) {
       if ((d.ch === '*' || d.ch === '_') && labelNodes.indexOf(d.node) !== -1) d.canClose = false;
     }
   }
+  // Unwrap GFM autolinks (k:5, gfm) in a forming link's children back
+  // to plain text: marked suppresses the url rule while tokenising a
+  // link that forms, so a URL/email inside its label stays literal.
+  // Explicit <...> autolinks (no gfm flag) are NOT unwrapped.
+  function unwrapGfmAutolinks(arr) {
+    for (let i = 0; i < arr.length; i++) {
+      const nd = arr[i];
+      if (nd.k === 5 && nd.gfm) {
+        arr[i] = { k: 0, s: nd.children && nd.children[0] ? nd.children[0].s : '' };
+      } else if (nd.children) {
+        unwrapGfmAutolinks(nd.children);
+      }
+    }
+  }
   function tryLink(closeIdx) {
     let opener = null;
     for (let k = delims.length - 1; k >= 0; k--) {
@@ -1904,6 +1919,8 @@ function parseInline(text, refs, st) {
       maskFailedInlineLink(opener, closeIdx);
       return -1;
     }
+    // GFM autolinks inside a forming link stay literal.
+    unwrapGfmAutolinks(children);
     // Deactivate [ delimiters inside the link text; re-tag emphasis
     // delimiters there to the link's children array.
     for (const d of delims) {
@@ -1995,6 +2012,32 @@ function parseInline(text, refs, st) {
     }
     return { end, email: m[0] };
   }
+  // Would the `]` at closeIdx close a link that forms? Replicates
+  // tryLink's resolution without side effects: nearest active `[`
+  // opener, valid label grammar, then inline dest / full ref /
+  // shortcut ref. A GFM autolink tail stops before such a `]` so the
+  // link can form; otherwise the tail consumes it (failed link).
+  function linkWouldFormAt(closeIdx) {
+    let opener = null;
+    for (let d = delims.length - 1; d >= 0; d--) {
+      if (delims[d].ch === '[' && delims[d].active) { opener = delims[d]; break; }
+    }
+    if (!opener) return false;
+    if (!labelBackticksOk(text.slice(opener.pos + 1, closeIdx))) return false;
+    const after = closeIdx + 1;
+    if (text.charCodeAt(after) === 40) {
+      if (parseInlineLink(after)) return true;
+    }
+    if (text.charCodeAt(after) === 91) {
+      const lab = parseLinkLabel(after);
+      if (lab) {
+        const rawKey = lab.label === '' ? text.slice(opener.pos + 1, closeIdx) : lab.label;
+        if (refs.get(normalizeLabel(rawKey))) return true;
+        return false; // full-ref attempt, no definition: no shortcut
+      }
+    }
+    return !!refs.get(normalizeLabel(text.slice(opener.pos + 1, closeIdx)));
+  }
   // Try a GFM autolink at position i. Returns {href, text, end} or null.
   function matchGfmUrl(i) {
     // mailto: / xmpp: (must not be preceded by an alphanumeric; scheme
@@ -2019,10 +2062,6 @@ function parseInline(text, refs, st) {
         if (k > end + 1) end = k;
       }
       return { href: text.slice(i, end), text: text.slice(i, end), end };
-    }
-    // Inside a link label, www./http(s)://ftp:// URLs are not autolinked.
-    for (let d = delims.length - 1; d >= 0; d--) {
-      if (delims[d].ch === '[' && delims[d].active) return null;
     }
     // www. (preceded by start / whitespace / * _ ~ ()
     if (text.startsWith('www.', i)) {
@@ -2060,10 +2099,13 @@ function parseInline(text, refs, st) {
       break;
     }
     if (!ok) return null;
-    // tail: [^\s<]*
+    // tail: [^\s<]* -- but stop before a `]` that closes a link
+    // which would form, so the link's `]` survives (a failed link's
+    // tail keeps consuming it, as marked does).
     while (k < n) {
       const c = text.charCodeAt(k);
       if (c === 32 || c === 9 || c === 10 || c === 60) break;
+      if (c === 93 && linkWouldFormAt(k)) break;
       k++;
     }
     const cand = backpedal(text.slice(i, k));
@@ -2124,7 +2166,7 @@ function parseInline(text, refs, st) {
       if (first.d) first.d.active = false;
       nodes.splice(firstIdx, 1);
     }
-    nodes.push({ k: 5, href: 'mailto:' + email, title: null, auto: true, children: [{ k: 0, s: email }] });
+    nodes.push({ k: 5, href: 'mailto:' + email, title: null, auto: true, gfm: true, children: [{ k: 0, s: email }] });
     return em.end;
   }
 
