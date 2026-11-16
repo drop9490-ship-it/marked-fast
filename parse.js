@@ -1442,7 +1442,7 @@ function matchAutolink(s, i) {
 }
 
 // ---------- inline scanner ----------
-function parseInline(text, refs) {
+function parseInline(text, refs, st) {
   const nodes = [];
   const delims = [];
   const n = text.length;
@@ -1554,7 +1554,13 @@ function parseInline(text, refs) {
       }
       const he = matchRawHtml(text, i);
       if (he !== -1) {
-        nodes.push({ k: 3, s: text.slice(i, he) });
+        const tagText = text.slice(i, he);
+        // marked's inline tag() sets state.inLink on `<a ...` and clears
+        // it on `</a>`; the flag persists across blocks for the whole
+        // parse and gates GFM autolinks (never reset between blocks).
+        if (/^<a /i.test(tagText)) st.inLink = true;
+        else if (/^<\/a>/i.test(tagText)) st.inLink = false;
+        nodes.push({ k: 3, s: tagText });
         i = he;
         continue;
       }
@@ -1595,7 +1601,7 @@ function parseInline(text, refs) {
     // Inside a link label, http(s):// / ftp:// / www. URLs are NOT
     // autolinked (marked leaves them as plain text in the link), but
     // mailto:/xmpp: and bare emails still are.
-    if (c === 119 || c === 104 || c === 72 || c === 102 || c === 70 || c === 109 || c === 77 || c === 120 || c === 88) { // w h H f F m M x X
+    if (!st.inLink && (c === 119 || c === 104 || c === 72 || c === 102 || c === 70 || c === 109 || c === 77 || c === 120 || c === 88)) { // w h H f F m M x X
       const m = matchGfmUrl(i);
       if (m) {
         nodes.push({ k: 5, href: m.href, title: null, auto: true, children: [{ k: 0, s: m.text }] });
@@ -1604,7 +1610,7 @@ function parseInline(text, refs) {
       }
     }
     if (c === 64) { // @ : possible GFM email autolink
-      const ni = matchGfmEmail(i);
+      const ni = st.inLink ? null : matchGfmEmail(i);
       if (ni !== null) { i = ni; continue; }
       pushText('@');
       i++;
@@ -1890,12 +1896,20 @@ function parseInline(text, refs) {
       const c = text.charCodeAt(end);
       if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45) return null;
       if (c === 95) {
-        // A trailing `_` blocks the email, except when it is an emphasis
-        // delimiter: a `_` followed by whitespace closes a `_..._` span
-        // (e.g. `_callback adds@x.com_ not`) and does not block it.
-        if (end + 1 >= n) return null;
-        const d = text.charCodeAt(end + 1);
-        if (!(d === 32 || d === 9 || d === 10)) return null;
+        // A trailing `_` run blocks the email unless it is an emphasis
+        // closer: the whole run must be followed by whitespace / end /
+        // punctuation, and an active `_` opener must exist for it to
+        // close (e.g. `__…table@x.com__ `). Without an opener
+        // (`foo@bar.com_ baz`, `foo@bar.com__ end`) it blocks.
+        let k = end;
+        while (k < n && text.charCodeAt(k) === 95) k++;
+        const after = k >= n ? '' : text[k];
+        const afterOk = after === '' || isWsCh(after) || isPunctCh(after);
+        let hasOpener = false;
+        for (const d of delims) {
+          if (d.ch === '_' && d.active && d.canOpen) { hasOpener = true; break; }
+        }
+        if (!afterOk || !hasOpener) return null;
       }
     }
     return { end, email: m[0] };
@@ -1979,12 +1993,30 @@ function parseInline(text, refs) {
   // part (already emitted as text) and match the full address.
   function matchGfmEmail(i) {
     let ls = i - 1;
+    let stoppedAtLive = false;
     while (ls >= 0) {
       const c = text.charCodeAt(ls);
-      if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 43 || c === 45) ls--;
-      else break;
+      if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 43 || c === 45) {
+        if (c === 95) {
+          // A `_` that is part of a live `_` delimiter run is an
+          // emphasis delimiter, not email text: the local part starts
+          // after that run. Inert `_` (intra-word, can neither open nor
+          // close) stays part of the local part (`foo_bar@x.com`).
+          let rs = ls;
+          while (rs > 0 && text.charCodeAt(rs - 1) === 95) rs--;
+          let re = ls + 1;
+          while (re < n && text.charCodeAt(re) === 95) re++;
+          const { leftFlanking, rightFlanking } = flanking(rs, re);
+          const before = rs > 0 ? text[rs - 1] : '';
+          const after = re < n ? text[re] : '';
+          const canOpen = leftFlanking && (!rightFlanking || isPunctCh(before));
+          const canClose = rightFlanking && (!leftFlanking || isPunctCh(after));
+          if (canOpen || canClose) { ls = re; stoppedAtLive = true; break; }
+        }
+        ls--;
+      } else break;
     }
-    ls++;
+    if (!stoppedAtLive) ls++;
     if (ls >= i) return null;
     const em = matchEmailAt(ls);
     if (!em) return null;
@@ -2121,20 +2153,20 @@ function parseInline(text, refs) {
 }
 
 // ---------- block rendering ----------
-function renderBlocks(node, out, refs) {
+function renderBlocks(node, out, refs, st) {
   switch (node.t) {
     case 'doc':
-      for (const ch of node.children) renderBlocks(ch, out, refs);
+      for (const ch of node.children) renderBlocks(ch, out, refs, st);
       break;
     case 'quote':
       out.push('<blockquote>\n');
-      for (const ch of node.children) renderBlocks(ch, out, refs);
+      for (const ch of node.children) renderBlocks(ch, out, refs, st);
       out.push('</blockquote>\n');
       break;
     case 'list': {
       const tag = node.bullet ? 'ul' : 'ol';
       out.push(node.bullet ? '<ul>\n' : (node.start !== 1 ? '<ol start="' + node.start + '">\n' : '<ol>\n'));
-      for (const ch of node.children) renderBlocks(ch, out, refs);
+      for (const ch of node.children) renderBlocks(ch, out, refs, st);
       out.push(node.bullet ? '</ul>\n' : '</ol>\n');
       break;
     }
@@ -2152,9 +2184,9 @@ function renderBlocks(node, out, refs) {
         for (let i = 0; i < node.children.length; i++) {
           const ch = node.children[i];
           if (ch.t === 'para') {
-            out.push(parseInline(paraTextOf(ch), refs));
+            out.push(parseInline(paraTextOf(ch), refs, st));
           } else {
-            renderBlocks(ch, out, refs);
+            renderBlocks(ch, out, refs, st);
           }
         }
         out.push('</li>\n');
@@ -2164,11 +2196,11 @@ function renderBlocks(node, out, refs) {
         for (let i = 0; i < node.children.length; i++) {
           const ch = node.children[i];
           if (!inputDone && inputHtml && ch.t === 'para') {
-            out.push('<p>' + inputHtml + parseInline(paraTextOf(ch), refs) + '</p>\n');
+            out.push('<p>' + inputHtml + parseInline(paraTextOf(ch), refs, st) + '</p>\n');
             inputDone = true;
           } else {
             if (!inputDone && inputHtml && i === 0) { out.push(inputHtml); inputDone = true; }
-            renderBlocks(ch, out, refs);
+            renderBlocks(ch, out, refs, st);
           }
         }
         out.push('</li>\n');
@@ -2176,10 +2208,10 @@ function renderBlocks(node, out, refs) {
       break;
     }
     case 'para':
-      out.push('<p>' + parseInline(paraTextOf(node), refs) + '</p>\n');
+      out.push('<p>' + parseInline(paraTextOf(node), refs, st) + '</p>\n');
       break;
     case 'h':
-      out.push('<h' + node.level + '>' + parseInline(node.text, refs) + '</h' + node.level + '>\n');
+      out.push('<h' + node.level + '>' + parseInline(node.text, refs, st) + '</h' + node.level + '>\n');
       break;
     case 'code': {
       let lang = '';
@@ -2201,7 +2233,7 @@ function renderBlocks(node, out, refs) {
       const ncol = aligns.length;
       const cell = (c, tag) => {
         const a = aligns[c.i];
-        return '<' + tag + (a ? ' align="' + a + '"' : '') + '>' + parseInline(c.s.trim(), refs) + '</' + tag + '>\n';
+        return '<' + tag + (a ? ' align="' + a + '"' : '') + '>' + parseInline(c.s.trim(), refs, st) + '</' + tag + '>\n';
       };
       out.push('<table>\n<thead>\n<tr>\n');
       for (let c = 0; c < ncol; c++) {
@@ -2243,6 +2275,10 @@ export function parse(markdown) {
     }
   })(doc);
   const out = [];
-  renderBlocks(doc, out, refs);
+  // Per-parse inline state (fresh each parse() call): inLink is set by
+  // an `<a ...>` raw-HTML tag and cleared only by `</a>`, persisting
+  // across blocks; it gates GFM autolinks (marked's Lexer.state.inLink).
+  const st = { inLink: false };
+  renderBlocks(doc, out, refs, st);
   return out.join('');
 }
