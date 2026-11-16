@@ -2109,6 +2109,12 @@ function parseInline(text, refs, st) {
     }
     if (!opener) return false;
     if (!labelBackticksOk(text.slice(opener.pos + 1, closeIdx))) return false;
+    const opIdx = nodes.indexOf(opener.node);
+    if (opIdx === -1) return false;
+    // A link cannot contain another link (images exempt): tryLink
+    // enforces this, so a label that already holds a formed link never
+    // forms -- the `]` then belongs to the autolink tail, not the link.
+    if (!opener.image && containsLink(nodes.slice(opIdx + 1))) return false;
     const after = closeIdx + 1;
     if (text.charCodeAt(after) === 40) {
       if (parseInlineLink(after)) return true;
