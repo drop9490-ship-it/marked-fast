@@ -3,6 +3,46 @@
 // Written from the CommonMark spec and the observed behaviour of marked on
 // the practice set; no code is taken from marked or any other renderer.
 
+// ---------- emphasis masking ----------
+// marked hides code spans, links and HTML tags from its emphasis scan by
+// first rewriting the paragraph text: backticks inside a code span become
+// '+', then each such span is replaced by a same-length '[aaa...]' placeholder.
+// A code span can therefore "form" in the masked copy even when this
+// parser did not tokenise it as one (an unbalanced run in a link label
+// pairs with a later run of the same length), and any * _ ~ run inside
+// that masked span is invisible to emphasis. We replicate just that
+// rewrite here to find the spans, so delimiter runs inside them can be
+// hidden. The two patterns below are the standard CommonMark code-span
+// shapes (an opening run, non-backtick content, the same closing run,
+// not followed by another backtick); the surrounding logic is our own.
+const MASK_OT_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const MASK_CODE_RE = /(?<!`)(`+)[^`]+\1(?!`)/g;
+// Ranges [start, end) of the paragraph text that the masking hides.
+// Only code spans are needed here: links and HTML tags are already
+// atomic nodes in this parser, so no paragraph-level delimiter run can
+// sit inside one; a phantom code span is the one case that can.
+function maskedCodeRanges(text) {
+  const t1 = text.replace(MASK_OT_RE, (m, open, esc) => {
+    if (esc !== undefined) return '+'.repeat(m.length);
+    if (open === undefined) return m;
+    // A code span: keep its delimiter runs, neutralise inner backticks.
+    return open + m.slice(open.length, m.length - open.length).replace(/`/g, '+') + open;
+  });
+  const ranges = [];
+  MASK_CODE_RE.lastIndex = 0;
+  let m;
+  while ((m = MASK_CODE_RE.exec(t1)) !== null) {
+    ranges.push([m.index, m.index + m[0].length]);
+  }
+  return ranges;
+}
+function inRanges(ranges, pos) {
+  for (let k = 0; k < ranges.length; k++) {
+    if (pos >= ranges[k][0] && pos < ranges[k][1]) return true;
+  }
+  return false;
+}
+
 // ---------- escaping ----------
 // Sticky email matcher (anchored at lastIndex, so no slice is needed).
 const EMAIL_RE = /[A-Za-z0-9._+-]+@[A-Za-z0-9-_]+(?:\.[A-Za-z0-9-_]*[A-Za-z0-9])+/y;
@@ -220,6 +260,15 @@ function prepLine(s) {
     }
   }
   return { s, exp, orig, lead };
+}
+// Is expanded column k the first expanded column of a tab in the
+// original line? A tab's expansion looks like spaces in the expanded
+// line, but it is content (to be expanded at its column), not
+// indentation to strip.
+function isTabStart(L, k) {
+  if (L.orig === null || k < 0 || k >= L.exp.length) return false;
+  const oi = L.orig[k];
+  return oi > 0 && L.s.charCodeAt(oi - 1) === 9 && (k === 0 || L.orig[k - 1] !== oi);
 }
 // Content of a prepared line from expanded column k (tabs preserved except
 // a partially consumed one, which becomes spaces).
@@ -969,7 +1018,21 @@ function parseBlocks(src) {
         if (len >= leaf.fenceLen && lineBlankFrom(L, q)) ok = true;
       }
       if (ok) { closeLeaf(); continue; }
+      // Content from expanded column pos. If pos sits inside a tab
+      // that starts after the quote marker (preQuotePos), lineContent
+      // would hand back the tab's remaining spaces expanded at the
+      // absolute column; the re-expansion below must instead see the
+      // raw tab so it can expand it at its column in the quote's text
+      // (pos - preQuotePos). A tab starting before the quote marker
+      // (e.g. in a list indent) keeps lineContent's spaces: there the
+      // absolute expansion is the right one.
       let content = lineContent(L, pos);
+      if (L.orig !== null && pos < L.exp.length && pos > 0 && L.orig[pos] > 0 && L.s.charCodeAt(L.orig[pos] - 1) === 9) {
+        // First expanded column of this tab: scan back while orig matches.
+        let a = pos;
+        while (a > 0 && L.orig[a - 1] === L.orig[pos]) a--;
+        if (a > preQuotePos) content = '\t' + L.s.slice(L.orig[pos]);
+      }
       if (stack.length > 1) {
         // Inside a container: marked outdents container prefixes in
         // columns, so expand the leading whitespace run to spaces,
@@ -1283,7 +1346,7 @@ function parseBlocks(src) {
                 const it = stack[s];
                 const C = it.contentIndent;
                 let I = 0;
-                while (cur + I < e.length && e.charCodeAt(cur + I) === 32) I++;
+                while (cur + I < e.length && e.charCodeAt(cur + I) === 32 && !isTabStart(L, cur + I)) I++;
                 if (I >= C || I >= 4) col = cur + Math.min(I, C);
                 break;
               }
@@ -1291,14 +1354,18 @@ function parseBlocks(src) {
             }
             if (!foundItem) {
               let I = 0;
-              while (cur + I < e.length && e.charCodeAt(cur + I) === 32) I++;
+              while (cur + I < e.length && e.charCodeAt(cur + I) === 32 && !isTabStart(L, cur + I)) I++;
               if (I >= 4) col = cur + 4;
             }
           }
         }
         if (!pushed) {
           let ln = { L, col };
-          if (allMatched && paraInQuote) { const s0 = lineContent(L, col); const s1 = expandLeadTabs(s0, col - preQuotePos); if (s1 !== s0) ln.txt = s1; }
+          // A leading tab in a lazy continuation line expands at its
+          // column too (marked does this even when the line did not
+          // match every container); the column is relative to the
+          // outermost quote marker that did match.
+          if (paraInQuote) { const s0 = lineContent(L, col); const s1 = expandLeadTabs(s0, col - preQuotePos); if (s1 !== s0) ln.txt = s1; }
           leaf.lines.push(ln);
         }
       } else {
@@ -1510,6 +1577,9 @@ function parseInline(text, refs, st) {
   const delims = [];
   const n = text.length;
   let i = 0;
+  // Spans the emphasis masking hides (phantom code spans). Only
+  // computed when the text has a backtick at all.
+  const maskRanges = text.indexOf('`') !== -1 ? maskedCodeRanges(text) : null;
 
   function pushText(s) {
     if (s === '') return;
@@ -1665,7 +1735,7 @@ function parseInline(text, refs, st) {
         canClose = rightFlanking;
       }
       if (ch === '~') { canOpen = canOpen && len <= 2; canClose = canClose && len <= 2; }
-      pushDelimNode(text.slice(i, j), { ch, len, canOpen, canClose, active: true, image: false });
+      pushDelimNode(text.slice(i, j), { ch, len, canOpen, canClose, active: true, image: false, pos: i, masked: maskRanges !== null && inRanges(maskRanges, i) });
       i = j;
       continue;
     }
@@ -1918,7 +1988,7 @@ function parseInline(text, refs, st) {
     if (opIdx === -1) return;
     const labelNodes = nodes.slice(opIdx + 1);
     for (const d of delims) {
-      if ((d.ch === '*' || d.ch === '_') && labelNodes.indexOf(d.node) !== -1) d.canClose = false;
+      if ((d.ch === '*' || d.ch === '_') && labelNodes.indexOf(d.node) !== -1) { d.canClose = false; d.noClose = true; }
     }
   }
   // Unwrap GFM autolinks (k:5, gfm) in a forming link's children back
@@ -1995,11 +2065,22 @@ function parseInline(text, refs, st) {
     // GFM autolinks inside a forming link stay literal.
     unwrapGfmAutolinks(children);
     // Deactivate [ delimiters inside the link text; re-tag emphasis
-    // delimiters there to the link's children array.
+    // delimiters there to the link's children array. Recompute their
+    // masking for the label's own context: marked re-tokenises the
+    // label, so a phantom span in the paragraph does not hide runs
+    // inside the label (and a phantom span inside the label does).
+    const labelText = text.slice(opener.pos + 1, closeIdx);
+    const labelMask = labelText.indexOf('`') !== -1 ? maskedCodeRanges(labelText) : null;
     for (const d of delims) {
       if (children.indexOf(d.node) !== -1) {
         if (d.ch === '[') d.active = false;
-        else d.arr = children;
+        else {
+          d.arr = children;
+          if ((d.ch === '*' || d.ch === '_' || d.ch === '~') && d.pos !== undefined) {
+            const lp = d.pos - (opener.pos + 1);
+            d.masked = labelMask !== null && inRanges(labelMask, lp);
+          }
+        }
       }
     }
     opener.active = false;
@@ -2250,6 +2331,101 @@ function parseInline(text, refs, st) {
   }
 
   // ---------- emphasis processing ----------
+  // A delimiter run's neighbours in its array, as raw characters.
+  // Non-text nodes contribute a representative character: a code span,
+  // tag, wrap, link or image starts/ends with punctuation, a hard
+  // break is whitespace. An empty node is transparent (null).
+  function nodeFirstChar(nd) {
+    switch (nd.k) {
+      case 0: return nd.s.length ? nd.s[0] : null;
+      case 1: return '`';
+      case 2: return '\n';
+      case 3: return '<';
+      case 4: return '*';
+      case 5: {
+        // A bare-URL/email GFM autolink's raw text IS the URL (no
+        // brackets); a markdown link starts with '['.
+        if (nd.gfm && nd.children && nd.children[0] && nd.children[0].s) return nd.children[0].s[0];
+        return '[';
+      }
+      case 6: return '!';
+      case 7: return nd.s;
+      default: return null;
+    }
+  }
+  function nodeLastChar(nd) {
+    switch (nd.k) {
+      case 0: return nd.s.length ? nd.s[nd.s.length - 1] : null;
+      case 1: return '`';
+      case 2: return '\n';
+      case 3: return '>';
+      case 4: return '*';
+      case 5: {
+        if (nd.gfm && nd.children && nd.children[0] && nd.children[0].s) {
+          const s = nd.children[0].s;
+          return s[s.length - 1];
+        }
+        return ']';
+      }
+      case 6: return ']';
+      case 7: return nd.s;
+      default: return null;
+    }
+  }
+  function neighborChars(arr, idx) {
+    let before = '', after = '';
+    for (let j = idx - 1; j >= 0; j--) { const c = nodeLastChar(arr[j]); if (c !== null) { before = c; break; } }
+    for (let j = idx + 1; j < arr.length; j++) { const c = nodeFirstChar(arr[j]); if (c !== null) { after = c; break; } }
+    return { before, after };
+  }
+  function isAlnumCh(c) { return c !== '' && /[\p{L}\p{N}]/u.test(c); }
+  function gfmPunctCh(c) { return c !== '~' && isPunctCh(c); }
+  // Classify a * / _ run the way marked's emStrong delimiter regexes
+  // do (groups 1-6). Punctuation is GFM (excludes '~') for '*', and
+  // plain (includes '~') for '_'. kind is opener / closer / both /
+  // neither; canOpen also applies the '_' intra-word guard.
+  function delimKind(ch, beforeCh, afterCh) {
+    const beforeWs = beforeCh === '' || isWsCh(beforeCh);
+    const afterWs = afterCh === '' || isWsCh(afterCh);
+    const beforePunct = ch === '*' ? gfmPunctCh(beforeCh) : isPunctCh(beforeCh);
+    const afterPunct = ch === '*' ? gfmPunctCh(afterCh) : isPunctCh(afterCh);
+    const bc = beforeWs ? 'ws' : beforePunct ? 'punct' : 'other';
+    const ac = afterWs ? 'ws' : afterPunct ? 'punct' : 'other';
+    let kind;
+    if (bc === 'ws' && ac === 'ws') kind = 'neither';
+    else if (bc === 'ws') kind = 'opener';
+    else if (bc === 'punct' && ac === 'ws') kind = 'closer';
+    else if (bc === 'punct' && ac === 'punct') kind = 'both';
+    else if (bc === 'punct') kind = 'opener';
+    else if (ac === 'other') kind = ch === '*' ? 'both' : 'neither';
+    else kind = 'closer';
+    let canOpen = kind === 'opener' || kind === 'both';
+    const canClose = kind === 'closer' || kind === 'both';
+    if (ch === '_' && canOpen) {
+      const afterNonPunct = afterCh !== '' && !isWsCh(afterCh) && !gfmPunctCh(afterCh);
+      if (afterNonPunct && isAlnumCh(beforeCh)) canOpen = false;
+    }
+    return { kind, canOpen, canClose };
+  }
+  function recomputeKind(rec, arr, idx) {
+    // A run hidden by the emphasis masking can neither open nor close.
+    if (rec.masked) {
+      rec.kind = 'neither';
+      rec.canOpen = false;
+      rec.canClose = false;
+      return;
+    }
+    const nc = neighborChars(arr, idx);
+    const r = delimKind(rec.ch, nc.before, nc.after);
+    rec.kind = r.kind;
+    rec.canOpen = r.canOpen;
+    rec.canClose = r.canClose;
+    if (rec.noClose) {
+      rec.canClose = false;
+      if (rec.kind === 'both') rec.kind = 'opener';
+      else if (rec.kind === 'closer') rec.kind = 'neither';
+    }
+  }
   function processEmphasis() {
     const byArr = new Map();
     for (const d of delims) {
@@ -2258,50 +2434,183 @@ function parseInline(text, refs, st) {
       if (!list) { list = []; byArr.set(d.arr, list); }
       list.push(d);
     }
-    for (const [arr, list] of byArr) processEmphasisIn(arr, list);
+    for (const [arr] of byArr) processEmphasisIn(arr);
   }
-  function processEmphasisIn(arr, list) {
+  function processEmphasisIn(arr) {
+    scanStar(arr);
+    scanTilde(arr);
+  }
+  function starRecords(arr) {
+    const ds = [];
+    for (const nd of arr) {
+      if (nd.d && (nd.d.ch === '*' || nd.d.ch === '_') && nd.d.active && !nd.d.absorbed) ds.push(nd.d);
+    }
+    return ds;
+  }
+  // Opener-first emphasis scan (marked's emStrong) for * and _.
+  function scanStar(arr) {
+    for (let idx = 0; idx < arr.length; idx++) {
+      const nd = arr[idx];
+      if (nd.d && (nd.d.ch === '*' || nd.d.ch === '_') && nd.d.active && !nd.d.absorbed) {
+        recomputeKind(nd.d, arr, idx);
+      }
+    }
+    let ds = starRecords(arr);
+    let oi = 0;
+    while (oi < ds.length) {
+      const opener = ds[oi];
+      if (!opener.active || opener.absorbed || !opener.canOpen || opener.len <= 0) { oi++; continue; }
+      if (tryOpener(arr, opener)) { ds = starRecords(arr); continue; }
+      oi++;
+    }
+  }
+  // The RDelim skip: a * inside a __...__ span (or a _ inside a
+  // **...** span) is hidden from the closer scan. The span must start
+  // at the first delimiter after the opener, hold exactly one run of
+  // the scanned char of length 1, and close with a run of length >= 2.
+  function skipHidden(arr, oi2, ch) {
+    const other = ch === '*' ? '_' : '*';
+    let j = oi2 + 1, first = null, firstIdx = -1;
+    for (; j < arr.length; j++) {
+      const nd = arr[j];
+      if (nd.d && nd.d.active && !nd.d.absorbed && (nd.d.ch === '*' || nd.d.ch === '_')) { first = nd.d; firstIdx = j; break; }
+    }
+    if (!first || first.ch !== other || first.len !== 2) return null;
+    let k = firstIdx + 1, mid = null, midIdx = -1;
+    for (; k < arr.length; k++) {
+      const nd = arr[k];
+      if (nd.d && nd.d.active && !nd.d.absorbed && (nd.d.ch === '*' || nd.d.ch === '_')) { mid = nd.d; midIdx = k; break; }
+    }
+    if (!mid || mid.ch !== ch || mid.len !== 1) return null;
+    let m = midIdx + 1, last = null;
+    for (; m < arr.length; m++) {
+      const nd = arr[m];
+      if (nd.d && nd.d.active && !nd.d.absorbed && (nd.d.ch === '*' || nd.d.ch === '_')) { last = nd.d; break; }
+    }
+    if (!last || last.ch !== other || last.len < 2) return null;
+    return mid;
+  }
+  function tryOpener(arr, opener) {
+    const L = opener.len;
+    const R = opener.kind === 'both';
+    const oi2 = arr.indexOf(opener.node);
+    if (oi2 === -1) return false;
+    const hidden = skipHidden(arr, oi2, opener.ch);
+    for (let k = L; k >= 1; k--) {
+      const o = k < L;
+      let m = k, f = 0;
+      let closer = null, bUsed = 0;
+      for (let j = oi2 + 1; j < arr.length; j++) {
+        const nd = arr[j];
+        if (!nd.d || nd.d.ch !== opener.ch || !nd.d.active || nd.d.absorbed) continue;
+        if (nd.d === hidden) continue;
+        const cand = nd.d;
+        if (cand.kind === 'neither') continue;
+        const B = cand.len;
+        if (cand.kind === 'opener') { m += B; continue; }
+        if (cand.kind === 'both' || R) {
+          if (o && cand.kind === 'both') break;
+          if (L % 3 !== 0 && (L + B) % 3 === 0) { f += B; continue; }
+        }
+        m -= B;
+        if (m > 0) continue;
+        bUsed = Math.min(B, B + m + f);
+        closer = cand;
+        break;
+      }
+      if (!closer) continue;
+      formStarWrap(arr, opener, closer, k, bUsed);
+      return true;
+    }
+    return false;
+  }
+  function formStarWrap(arr, opener, closer, k, bUsed) {
+    const use = (Math.min(k, bUsed) % 2 === 1) ? 1 : 2;
+    const tag = use === 2 ? 'strong' : 'em';
+    const oi2 = arr.indexOf(opener.node);
+    const ci2 = arr.indexOf(closer.node);
+    const L = opener.len, B = closer.len;
+    const children = [];
+    let openLeft = null, closeLeft = null;
+    if (k - use > 0) {
+      const node = { k: 0, s: opener.ch.repeat(k - use), d: null };
+      openLeft = { ch: opener.ch, len: k - use, canOpen: false, canClose: false, active: true, image: false, node, arr: children };
+      node.d = openLeft;
+      children.push(node);
+      delims.push(openLeft);
+    }
+    const middle = arr.slice(oi2 + 1, ci2);
+    for (const nd of middle) children.push(nd);
+    if (bUsed - use > 0) {
+      const node = { k: 0, s: closer.ch.repeat(bUsed - use), d: null };
+      closeLeft = { ch: closer.ch, len: bUsed - use, canOpen: false, canClose: false, active: true, image: false, node, arr: children };
+      node.d = closeLeft;
+      children.push(node);
+      delims.push(closeLeft);
+    }
+    for (const nd of middle) if (nd.d) nd.d.arr = children;
+    const wrap = { k: 4, tag, children };
+    const replacement = [];
+    if (L - k > 0) {
+      opener.node.s = opener.ch.repeat(L - k);
+      opener.node.d = null;
+      opener.active = false;
+      replacement.push(opener.node);
+    } else {
+      opener.active = false;
+    }
+    replacement.push(wrap);
+    let closerRemIdx = -1;
+    if (B - bUsed > 0) {
+      closer.node.s = closer.ch.repeat(B - bUsed);
+      closer.len = B - bUsed;
+      closer.node.d = closer;
+      replacement.push(closer.node);
+      closerRemIdx = oi2 + replacement.length - 1;
+    } else {
+      closer.active = false;
+    }
+    arr.splice(oi2, ci2 - oi2 + 1, ...replacement);
+    if (openLeft) recomputeKind(openLeft, children, 0);
+    if (closeLeft) recomputeKind(closeLeft, children, children.length - 1);
+    if (closerRemIdx !== -1) recomputeKind(closer, arr, closerRemIdx);
+    processEmphasisIn(children);
+  }
+  // Closer-first scan for ~ (unchanged from the old shared loop).
+  function scanTilde(arr) {
+    const list = [];
+    for (const nd of arr) {
+      if (nd.d && nd.d.ch === '~' && nd.d.active && !nd.d.absorbed) list.push(nd.d);
+    }
     for (let ci = 0; ci < list.length; ci++) {
       const closer = list[ci];
-      if (!closer.active || !closer.canClose || closer.absorbed) continue;
-      // The closer's position is fixed for this candidate scan.
+      if (!closer.active || !closer.canClose || closer.absorbed || closer.masked) continue;
       const ci2 = arr.indexOf(closer.node);
       if (ci2 === -1) continue;
       let opener = null;
       for (let oi = ci - 1; oi >= 0; oi--) {
         const cand = list[oi];
-        if (cand.ch !== closer.ch || !cand.active || !cand.canOpen || cand.absorbed) continue;
-        // Rule of 3: if either delimiter can both open and close, and
-        // the sum of the run lengths is a multiple of 3, they cannot
-        // match -- unless both lengths are themselves multiples of 3.
-        if (closer.ch !== '~' && (cand.canClose || closer.canOpen) && (cand.len + closer.len) % 3 === 0 && !(cand.len % 3 === 0 && closer.len % 3 === 0)) continue;
-        // The opener must still be a sibling in this array (not already
-        // wrapped inside a formed emphasis/link element); otherwise keep
-        // looking for an earlier opener. List order is text order, so a
-        // non-absorbed earlier candidate is necessarily before the
-        // closer in the array.
+        if (cand.ch !== closer.ch || !cand.active || !cand.canOpen || cand.absorbed || cand.masked) continue;
         opener = cand;
         break;
       }
       if (!opener) continue;
-      let use = 1;
-      if (closer.ch === '~') use = Math.min(opener.len, closer.len);
-      else if (opener.len >= 2 && closer.len >= 2) use = 2;
+      const use = Math.min(opener.len, closer.len);
       const oi2 = arr.indexOf(opener.node);
       const children = arr.slice(oi2 + 1, ci2);
-      const tag = closer.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
-      const wrap = { k: 4, tag, children };
+      const wrap = { k: 4, tag: 'del', children };
       opener.len -= use;
       closer.len -= use;
       if (opener.len === 0) { opener.node.s = ''; opener.active = false; }
       else opener.node.s = opener.node.s.slice(0, opener.node.s.length - use);
       if (closer.len === 0) { closer.node.s = ''; closer.active = false; }
       else closer.node.s = closer.node.s.slice(use);
-      // Nodes swallowed into the wrap are no longer siblings in this
-      // array; mark any delimiter records they held so later scans skip
-      // them in O(1) instead of an indexOf.
-      const swallowed = arr.splice(oi2 + 1, ci2 - oi2 - 1, wrap);
-      for (const nd of swallowed) if (nd.d) nd.d.absorbed = true;
+      // Re-tag the swallowed records to the children array and recurse
+      // (marked re-tokenises the del's inner text, so inner emphasis
+      // sees the del boundary as end-of-string).
+      for (const nd of children) if (nd.d) nd.d.arr = children;
+      arr.splice(oi2 + 1, ci2 - oi2 - 1, wrap);
+      processEmphasisIn(children);
       if (closer.active && closer.canClose && closer.len > 0) ci--;
     }
   }
