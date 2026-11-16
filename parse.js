@@ -1066,6 +1066,10 @@ function parseBlocks(src) {
     // (blockquote, list items) followed by a leaf.
     let cur = pos;
     let started = false;
+    // True when this line started a sibling item in an already-open
+    // list: the item is not a new block inside the parent item, so a
+    // blank line before it must not make the parent item blankBetween.
+    let siblingItem = false;
     for (let guard = 0; guard < 12 && !started; guard++) {
       // (a) blockquote container start
       {
@@ -1153,6 +1157,10 @@ function parseBlocks(src) {
             const last = parent.children[parent.children.length - 1];
             if (last && last.t === 'list' && sameListType(last, item)) list = last;
           }
+          // A sibling item in the open list is not a new block inside
+          // the parent item: a blank line before it separated list
+          // items, so it must not make any ancestor item blankBetween.
+          if (listOnStack) siblingItem = true;
           if (!list) {
             list = { t: 'list', bullet: item.bullet, bulletChar: item.bulletChar, delim: item.delim, start: item.start, children: [] };
             parent.children.push(list);
@@ -1264,13 +1272,15 @@ function parseBlocks(src) {
     // content turns a pending blank into a blank-between; the outer
     // items' marks are cleared (a blank line deep inside a nested item
     // does not loosen the outer lists). The deepest item also loses its
-    // directBlank (it did not end with a blank line).
+    // directBlank (it did not end with a blank line). A sibling item in
+    // an open list is not new content inside the parent item, so it
+    // only clears the marks and never sets blankBetween.
     {
       let deepest = -1;
       for (let s = 1; s < stack.length; s++) {
         if (stack[s].t === 'item' && stack[s].pendingBlank) deepest = s;
       }
-      if (deepest !== -1) { stack[deepest].blankBetween = true; stack[deepest].directBlank = false; }
+      if (deepest !== -1 && !siblingItem) { stack[deepest].blankBetween = true; stack[deepest].directBlank = false; }
       for (let s = 1; s < stack.length; s++) {
         if (stack[s].t === 'item') stack[s].pendingBlank = false;
       }
