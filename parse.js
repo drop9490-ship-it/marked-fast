@@ -4,6 +4,8 @@
 // the practice set; no code is taken from marked or any other renderer.
 
 // ---------- escaping ----------
+// Sticky email matcher (anchored at lastIndex, so no slice is needed).
+const EMAIL_RE = /[A-Za-z0-9._+-]+@[A-Za-z0-9-_]+(?:\.[A-Za-z0-9-_]*[A-Za-z0-9])+/y;
 // Expand leading tabs in a code-block content line to spaces. A tab at
 // column col expands to the next tab stop (4 - col%4 spaces). Only
 // applies when col > 0 (a tab at column 0 is literal content in marked).
@@ -1784,7 +1786,8 @@ function parseInline(text, refs) {
   // [A-Za-z0-9-_]*[A-Za-z0-9] (later); the char after the domain must not
   // be a word char or '-'.
   function matchEmailAt(i) {
-    const m = /^[A-Za-z0-9._+-]+@[A-Za-z0-9-_]+(?:\.[A-Za-z0-9-_]*[A-Za-z0-9])+/.exec(text.slice(i));
+    EMAIL_RE.lastIndex = i;
+    const m = EMAIL_RE.exec(text);
     if (!m) return null;
     const end = i + m[0].length;
     if (end < n) {
@@ -1930,21 +1933,23 @@ function parseInline(text, refs) {
   function processEmphasisIn(arr, list) {
     for (let ci = 0; ci < list.length; ci++) {
       const closer = list[ci];
-      if (!closer.active || !closer.canClose) continue;
+      if (!closer.active || !closer.canClose || closer.absorbed) continue;
+      // The closer's position is fixed for this candidate scan.
+      const ci2 = arr.indexOf(closer.node);
+      if (ci2 === -1) continue;
       let opener = null;
       for (let oi = ci - 1; oi >= 0; oi--) {
         const cand = list[oi];
-        if (cand.ch !== closer.ch || !cand.active || !cand.canOpen) continue;
+        if (cand.ch !== closer.ch || !cand.active || !cand.canOpen || cand.absorbed) continue;
         // Rule of 3: if either delimiter can both open and close, and
         // the sum of the run lengths is a multiple of 3, they cannot
         // match -- unless both lengths are themselves multiples of 3.
         if (closer.ch !== '~' && (cand.canClose || closer.canOpen) && (cand.len + closer.len) % 3 === 0 && !(cand.len % 3 === 0 && closer.len % 3 === 0)) continue;
         // The opener must still be a sibling in this array (not already
         // wrapped inside a formed emphasis/link element); otherwise keep
-        // looking for an earlier opener.
-        const oi2 = arr.indexOf(cand.node);
-        const ci2 = arr.indexOf(closer.node);
-        if (oi2 === -1 || ci2 === -1 || oi2 >= ci2) continue;
+        // looking for an earlier opener. List order is text order, so a
+        // non-absorbed earlier candidate is necessarily before the
+        // closer in the array.
         opener = cand;
         break;
       }
@@ -1953,7 +1958,6 @@ function parseInline(text, refs) {
       if (closer.ch === '~') use = Math.min(opener.len, closer.len);
       else if (opener.len >= 2 && closer.len >= 2) use = 2;
       const oi2 = arr.indexOf(opener.node);
-      const ci2 = arr.indexOf(closer.node);
       const children = arr.slice(oi2 + 1, ci2);
       const tag = closer.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
       const wrap = { k: 4, tag, children };
@@ -1963,7 +1967,11 @@ function parseInline(text, refs) {
       else opener.node.s = opener.node.s.slice(0, opener.node.s.length - use);
       if (closer.len === 0) { closer.node.s = ''; closer.active = false; }
       else closer.node.s = closer.node.s.slice(use);
-      arr.splice(oi2 + 1, ci2 - oi2 - 1, wrap);
+      // Nodes swallowed into the wrap are no longer siblings in this
+      // array; mark any delimiter records they held so later scans skip
+      // them in O(1) instead of an indexOf.
+      const swallowed = arr.splice(oi2 + 1, ci2 - oi2 - 1, wrap);
+      for (const nd of swallowed) if (nd.d) nd.d.absorbed = true;
       if (closer.active && closer.canClose && closer.len > 0) ci--;
     }
   }
