@@ -652,8 +652,13 @@ function parseBlocks(src) {
     // Header must have at least one cell; adjust to ncol.
     const rows = [];
     for (let i = 2; i < headLines.length; i++) {
-      if (headLines[i].trim() === '') continue; // blank lines end the table? no: skip
-      rows.push(splitRow(headLines[i]));
+      const hl = headLines[i];
+      // A tab-only line is an empty row: marked's table regex excludes
+      // only spaces-only lines ((?! *\n)), so a tab line passes and
+      // becomes a row. A spaces-only line is skipped (it cannot be in
+      // a paragraph except the EOF trailing-spaces case, not a row).
+      if (hl.trim() === '' && hl.indexOf('\t') === -1) continue;
+      rows.push(splitRow(hl));
     }
     // A table's rows are only the paragraph's lines; blank line ends it.
     // (headLines came from a single paragraph, so no blank lines inside.)
@@ -1039,6 +1044,17 @@ function parseBlocks(src) {
         leaf.lines.push({ L, col: pos });
         continue;
       }
+      // Tab-only blank line inside a paragraph that already forms a
+      // valid table: marked keeps it as an empty row, so keep it in
+      // the paragraph instead of closing it. (A tab line before the
+      // delimiter still breaks the table: tryTable fails there, so
+      // the line closes the paragraph as usual. Tab lines between
+      // plain paragraphs do not diverge -- marked's paragraph regex
+      // excludes [ \t]+\n lines -- so this is table-scoped.)
+      if (leaf && leaf.t === 'para' && allMatched && lineContent(L, pos).indexOf('\t') !== -1 && tryTable(leaf.lines)) {
+        leaf.lines.push({ L, col: pos });
+        continue;
+      }
       // Blank line: closes the open leaf, and any container the blank
       // line does not match (a blockquote without its marker). A list
       // item is matched by a blank line, so lists stay open.
@@ -1075,15 +1091,17 @@ function parseBlocks(src) {
         while (q < e.length && e.charCodeAt(q) === ch) q++;
         if (lineBlankFrom(L, q)) {
           leaf.lines = stripLeadingRefDefs(leaf.lines);
-          if (leaf.lines.length > 0) {
+          // A paragraph that already forms a table is not a setext
+          // heading: the =/- line is a table row, not an underline.
+          if (leaf.lines.length > 0 && !tryTable(leaf.lines)) {
             const h = { t: 'h', level: ch === 61 ? 1 : 2, text: paraText(leaf).trim() };
             const parent = stack[stack.length - 1];
             parent.children[parent.children.length - 1] = h;
             leaf = null;
             continue;
           }
-          // Nothing left: fall through so the underline line joins the
-          // paragraph as content.
+          // Nothing left, or a table: fall through so the underline
+          // line joins the paragraph as content.
         }
       }
     }
